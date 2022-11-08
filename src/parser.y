@@ -218,7 +218,16 @@ request_header: token ows t_colon ows text ows t_crlf {
  * All the best!
  *
  */
-request: request_line request_header t_crlf{
+request_header_field: request_header {
+	parsing_request->headers = realloc(parsing_request->headers,
+		sizeof(Request_header)*(parsing_request->header_count + 1));
+}; |
+request_header_field request_header {
+	parsing_request->headers = realloc(parsing_request->headers,
+		sizeof(Request_header)*(parsing_request->header_count + 1));
+};
+
+request: request_line request_header_field t_crlf {
 	YPRINTF("parsing_request: Matched Success.\n");
 	return SUCCESS;
 };
