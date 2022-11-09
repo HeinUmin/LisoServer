@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "parse.h"
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
@@ -85,6 +86,21 @@ int main(int argc, char* argv[])
 
         while((readret = recv(client_sock, buf, BUF_SIZE, 0)) >= 1)
         {
+            Request *request = parse(buf,readret,client_sock);
+            if (request == NULL)
+            {
+                memset(buf, 0, BUF_SIZE);
+                strcpy(buf, "HTTP/1.1 400 Bad Request\r\n\r\n");
+                readret = strlen(buf);
+            }
+            else if (!strcmp(request->http_method, "GET") &&
+                !strcmp(request->http_method, "HEAD") &&
+                !strcmp(request->http_method, "POST"))
+            {
+                memset(buf, 0, BUF_SIZE);
+                strcpy(buf, "HTTP/1.1 501 Not Implemented\r\n\r\n");
+                readret = strlen(buf);
+            }
             if (send(client_sock, buf, readret, 0) != readret)
             {
                 close_socket(client_sock);
@@ -93,6 +109,11 @@ int main(int argc, char* argv[])
                 return EXIT_FAILURE;
             }
             memset(buf, 0, BUF_SIZE);
+            if(request!=NULL)
+            {
+                free(request->headers);
+                free(request);
+            }
         } 
 
         if (readret == -1)

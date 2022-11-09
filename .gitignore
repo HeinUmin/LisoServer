@@ -7,5 +7,6 @@ src/y.tab.h
 src/parse.h
 test/
 obj/
+y.*
 .vscode/
 .history/
