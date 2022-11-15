@@ -19,13 +19,14 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <fcntl.h>
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
 
 int main(int argc, char* argv[])
 {
-    if (argc != 3)
+    if (argc < 3)
     {
         fprintf(stderr, "usage: %s <server-ip> <port>",argv[0]);
         return EXIT_FAILURE;
@@ -60,7 +61,16 @@ int main(int argc, char* argv[])
     }
         
     char msg[BUF_SIZE]; 
-    fgets(msg, BUF_SIZE, stdin);
+    if (argc > 3)
+    {
+        int fd_in = open(argv[3], O_RDONLY);
+        if(fd_in < 0) {
+            printf("Failed to open the file\n");
+            return 0;
+        }
+        read(fd_in,msg,8192);
+    }
+    else fgets(msg, BUF_SIZE, stdin);
     
     int bytes_received;
     fprintf(stdout, "Sending %s", msg);

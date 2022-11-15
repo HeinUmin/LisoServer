@@ -94,6 +94,7 @@ Request *parsing_request;
 %type<str> ows
 %type<str> token
 %type<str> text
+%type<str> request_header_field
 
 %%
 

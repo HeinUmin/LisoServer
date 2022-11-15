@@ -6,11 +6,23 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <signal.h>
 #include <unistd.h>
 #include "parse.h"
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 4096
+
+int app_stopped = 0;
+
+void sigint_handler(int sig)
+{
+    if (sig == SIGINT)
+    {
+        fprintf(stdout, "ctrl+c pressed!\n");
+        app_stopped = 1;
+    }
+}
 
 int close_socket(int sock)
 {
@@ -29,8 +41,10 @@ int main(int argc, char *argv[])
     socklen_t cli_size;
     struct sockaddr_in addr, cli_addr;
     char buf[BUF_SIZE];
-    int max_fd, nready, i, nread;
+    int reuse, max_fd, nready, i, nread;
     fd_set rfds, rset;
+
+    signal(SIGINT, sigint_handler);
 
     fprintf(stdout, "----- Echo Server -----\n");
 
@@ -41,9 +55,16 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    reuse = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1)
+    {
+        printf("Setsockopt error.\n");
+        return 1;
+    }
+
     addr.sin_family = AF_INET;
     addr.sin_port = htons(ECHO_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     /* servers bind sockets to ports---notify the OS they accept connections */
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)))
@@ -70,6 +91,27 @@ int main(int argc, char *argv[])
         rset = rfds;
         nready = select(FD_SETSIZE, &rset, NULL, NULL, NULL);
 
+        if (app_stopped)
+        {
+            for (i = sock + 1; i <= max_fd; i++)
+            {
+                if (FD_ISSET(i, &rfds))
+                {
+                    if (close_socket(i))
+                    {
+                        fprintf(stderr, "Error closing client socket.\n");
+                        return EXIT_FAILURE;
+                    }
+                    else
+                    {
+                        FD_CLR(i, &rfds);
+                        fprintf(stdout, "Removing client on fd %d\n", i);
+                    }
+                }
+            }
+            break;
+        }
+
         if (nready < 1)
         {
             fprintf(stderr, "Select error.\n");
@@ -84,6 +126,12 @@ int main(int argc, char *argv[])
             {
                 close(sock);
                 fprintf(stderr, "Error accepting connection.\n");
+                return EXIT_FAILURE;
+            }
+            if (client_sock >= FD_SETSIZE)
+            {
+                close(sock);
+                fprintf(stderr, "Too many clients.\n");
                 return EXIT_FAILURE;
             }
             FD_SET(client_sock, &rfds);
@@ -111,7 +159,7 @@ int main(int argc, char *argv[])
                     else
                     {
                         FD_CLR(i, &rfds);
-                        printf("removing client on fd %d\n", i);
+                        fprintf(stdout, "removing client on fd %d\n", i);
                     }
                 }
                 else if ((readret = recv(i, buf, BUF_SIZE, 0)) >= 1)
