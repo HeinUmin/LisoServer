@@ -233,6 +233,7 @@ int main(int argc, char *argv[])
     char buf[BUF_SIZE];
     int reuse, max_fd, nready, i, nread;
     fd_set rfds, rset;
+    mkdir("log", 0777);
     FILE *parse_log = fopen("log/parse.out", "w");
     fclose(parse_log);
     access_log = fopen("log/access.log", "w");
@@ -364,8 +365,7 @@ int main(int argc, char *argv[])
                     {
                         FD_CLR(i, &rfds);
                         close_socket(i);
-                        continue;
-                        // return EXIT_FAILURE;
+                        fprintf(stdout, "Removing client on fd %d\n", i);
                     }
                     memset(buf, 0, BUF_SIZE);
                     if (request != NULL)
@@ -373,8 +373,6 @@ int main(int argc, char *argv[])
                         free(request->headers);
                         free(request);
                     }
-                    // close_socket(i);
-                    // FD_CLR(i, &rfds);
                 }
 
                 if (readret == -1)
