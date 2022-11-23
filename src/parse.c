@@ -55,6 +55,9 @@ Request * parse(char *buffer, int size, int socketFd) {
         request->headers = (Request_header *) malloc(sizeof(Request_header)*1);
 		set_parsing_options(buf, i, request);
 		yyrestart(NULL);
+		FILE *log = fopen("log/parse.out", "a");
+		fprintf(log, "----- New Request -----\n");
+		fclose(log);
 		if (yyparse() == SUCCESS) {
             return request;
 		}

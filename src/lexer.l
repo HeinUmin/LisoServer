@@ -19,7 +19,11 @@
 #define LEXDEBUG
 #ifdef LEXDEBUG
 #include <stdio.h>
-#define LPRINTF(...) printf(__VA_ARGS__)
+#define LPRINTF(...) do {					\
+	FILE *log = fopen("log/parse.out", "a");\
+	fprintf(log, __VA_ARGS__);				\
+	fclose(log);							\
+	} while(0)
 #else
 #define LPRINTF(...)
 #endif
@@ -55,6 +59,9 @@ extern int parsing_offset;	/* Current offset in the buffer */
 
 
 %}
+
+%option noinput
+%option nounput
 
 /*
  * Following is a list of rules specified in RFC 2616 section 2:

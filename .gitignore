@@ -1,6 +1,7 @@
 echo_client
 echo_server
 example
+liso_server
 src/lex.yy.c
 src/y.tab.c
 src/y.tab.h
@@ -10,3 +11,4 @@ obj/
 y.*
 .vscode/
 .history/
+log/
