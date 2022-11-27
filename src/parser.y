@@ -12,11 +12,7 @@
 #define YYERROR_VERBOSE
 #ifdef YACCDEBUG
 #include <stdio.h>
-#define YPRINTF(...) do {					\
-	FILE *log = fopen("log/parse.out", "a");\
-	fprintf(log, __VA_ARGS__);				\
-	fclose(log);							\
-	} while(0)
+#define YPRINTF(...) fprintf(parse_log, __VA_ARGS__)
 #else
 #define YPRINTF(...)
 #endif
