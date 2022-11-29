@@ -12,7 +12,7 @@
 #define YYERROR_VERBOSE
 #ifdef YACCDEBUG
 #include <stdio.h>
-#define YPRINTF(...) fprintf(parse_log, __VA_ARGS__)
+#define YPRINTF(...) printf(__VA_ARGS__)
 #else
 #define YPRINTF(...)
 #endif

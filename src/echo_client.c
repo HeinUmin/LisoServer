@@ -73,12 +73,12 @@ int main(int argc, char* argv[])
     else fgets(msg, BUF_SIZE, stdin);
     
     int bytes_received;
-    fprintf(stdout, "Sending %s", msg);
+    fprintf(stdout, "Sending\n%s", msg);
     send(sock, msg , strlen(msg), 0);
     if((bytes_received = recv(sock, buf, BUF_SIZE, 0)) > 1)
     {
         buf[bytes_received] = '\0';
-        fprintf(stdout, "Received %s", buf);
+        fprintf(stdout, "Received\n%s", buf);
     }        
 
     freeaddrinfo(servinfo);

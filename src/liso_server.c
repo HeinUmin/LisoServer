@@ -10,7 +10,7 @@
 #define ECHO_PORT 9999
 #define BUF_SIZE 8192
 
-int log_level = 2;
+static int log_level = 2;
 static int app_stopped = 0;
 static FILE *access_log = NULL;
 static FILE *error_log = NULL;
@@ -20,6 +20,7 @@ static int sock = -1;
 static int max_fd = 2;
 static struct sockaddr_in sockaddr[1024];
 static fd_set rfds;
+static Request *request;
 
 static inline int htoi(char *s)
 {
@@ -101,9 +102,13 @@ void get_filetype(char *filename, char *filetype)
  */
 void set_log_level(char *level)
 {
-    char *default_char = "List of log level:\n-d -- debug\n-i -- infomation\n"
-                         "-w -- warning\n-e -- error\n-f -- fatal\n"
-                         "Log level has been set as default 'info'.\n";
+    /**
+     *如果输入的参数不合法，则将log_level设定为默认值2，并输出提示信息
+     * 由于DEBUG和TRACE等级仅用于调试，所以并未显示在提示信息中
+     */
+    const char *default_char = "List of log level:\n-i -- infomation\n"
+                               "-w -- warning\n-e -- error\n-f -- fatal\n"
+                               "Log level has been set as default 'info'.\n";
     if (level[0] != '-')
     {
         puts(default_char);
@@ -163,16 +168,27 @@ int init_log()
 /**
  * @brief 写访问日志
  * @param addr 访问者信息
- * @param msg 请求行
+ * @param code 状态代码
+ * @param sent 已发送字节数
  */
-void write_access_log(struct sockaddr_in addr, char *msg)
+void write_access_log(struct sockaddr_in addr, int code, long sent)
 {
     char time_char[32];
     time_t now = time(NULL);
     strftime(time_char, sizeof(time_char),
              "[%d/%b/%Y:%H:%M:%S %z]", gmtime(&now));
-    fprintf(access_log, "%s - - %s \"%s\" ",
-            inet_ntoa(addr.sin_addr), time_char, msg);
+    fprintf(access_log, "%s - - %s ", inet_ntoa(addr.sin_addr), time_char);
+    if (request == NULL)
+        fprintf(access_log, "\"Bad Request\" 400 -\n");
+    else
+    {
+        fprintf(access_log, "\"%s %s %s\" ",
+                request->http_method, request->http_uri, request->http_version);
+        if (sent > 0)
+            fprintf(access_log, "%d %ld\n", code, sent);
+        else
+            fprintf(access_log, "%d -\n", code);
+    }
 }
 
 /**
@@ -190,7 +206,7 @@ void write_error_log(int level, struct sockaddr_in addr, char *src, char *msg)
         return;
     strncpy(time_char, ctime(&now), 24);
     time_char[24] = '\0';
-    fprintf(error_log, "[%s] [:%s] [pid %d] [client %s:%d] %s:  %s\n",
+    fprintf(error_log, "[%s] [%s] [pid %d] [client %s:%d] %s:  %s\n",
             time_char, level_char[level], getpid(),
             inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), src, msg);
 }
@@ -199,14 +215,14 @@ void write_error_log(int level, struct sockaddr_in addr, char *src, char *msg)
  * @brief 终止动作
  * @param sig 终止信号
  */
-void sigint_handler(int sig)
+void signal_handler(int sig)
 {
-    if (sig == SIGINT)
-    {
-        write_error_log(3, sockaddr[sock], "liso", strerror(4));
-        fprintf(stdout, "Detected CTRL+C.\n");
-        app_stopped = 1;
-    }
+    // 为防止程序被socket阻塞无法退出，当接收到3个以上终止信号时，直接退出程序
+    if (app_stopped > 3)
+        exit(1);
+    write_error_log(3, sockaddr[sock], "liso", "Interrupted by signal");
+    fprintf(stdout, "Interrupted by signal %d.\n", sig);
+    app_stopped++;
 }
 
 /**
@@ -283,7 +299,9 @@ int init_socket()
     sockaddr[0].sin_addr.s_addr = htonl(INADDR_ANY);
 
     // 重定义程序终止行为
-    if (signal(SIGINT, sigint_handler) == SIG_ERR)
+    if ((signal(SIGINT, signal_handler) == SIG_ERR) ||
+        (signal(SIGQUIT, signal_handler) == SIG_ERR) ||
+        (signal(SIGTERM, signal_handler) == SIG_ERR))
     {
         write_error_log(3, sockaddr[0], "signal", strerror(errno));
         fprintf(stderr, "Failed set signal handler.\n");
@@ -345,19 +363,19 @@ int init_socket()
  * @param client_socket 发送目标
  * @param buf 发送内容
  * @param length 发送长度
- * @return int 发送成功返回0，发送失败返回1
+ * @return long 返回发送字节数，发生错误返回负数
  */
-int send_message(int client_socket, char *buf, int length)
+long send_message(int client_socket, char *buf, int length)
 {
+    int readret;
     write_error_log(0, sockaddr[client_socket], "SEND", buf);
-    if (send(client_socket, buf, length, 0) != length)
+    if ((readret = send(client_socket, buf, length, 0)) != length)
     {
         write_error_log(4, sockaddr[client_socket], "socket", strerror(errno));
         fprintf(stderr, "Error sending to client.\n");
         close_socket(client_socket);
-        return 1;
     }
-    return 0;
+    return readret;
 }
 
 /**
@@ -370,10 +388,78 @@ int send_message(int client_socket, char *buf, int length)
 int send_error(int client_socket, int code, char *msg)
 {
     char buf[BUF_SIZE];
-    fprintf(access_log, "%d -\n", code);
+    write_access_log(sockaddr[client_socket], code, 0);
     memset(buf, 0, BUF_SIZE);
     sprintf(buf, "HTTP/1.1 %d %s\r\n\r\n", code, msg);
-    return send_message(client_socket, buf, strlen(buf));
+    if (send_message(client_socket, buf, strlen(buf)) != strlen(buf))
+        return 1;
+    else
+    {
+        close_socket(client_socket);
+        return 0;
+    }
+}
+
+/**
+ * @brief 发送文件
+ * @param client_socket 发送目标
+ * @param buf 缓冲区
+ * @param file 文件名
+ * @param file_size 文件大小
+ */
+void send_file(int client_socket, char *buf, char *file, long file_size)
+{
+    FILE *fp;
+    long rest, readret;
+    if ((fp = fopen(file, "rb")) == NULL)
+    {
+        write_error_log(4, sockaddr[client_socket], "file", strerror(errno));
+        send_error(client_socket, 500, "Internal Server Error");
+        return;
+    }
+    int headsize = strlen(buf);
+    rest = file_size + headsize;
+    write_error_log(2, sockaddr[client_socket], "message", "Prepared");
+    fread(buf + headsize, sizeof(char), BUF_SIZE - headsize, fp);
+    if (rest > BUF_SIZE)
+    {
+        readret = send_message(client_socket, buf, BUF_SIZE);
+        if (readret != BUF_SIZE)
+        {
+            write_access_log(sockaddr[client_socket],
+                             200, readret - headsize);
+            return;
+        }
+    }
+    else
+    {
+        readret = send_message(client_socket, buf, rest);
+        write_access_log(sockaddr[client_socket], 200, readret - headsize);
+        return;
+    }
+    rest -= BUF_SIZE;
+    while (1)
+    {
+        fread(buf, sizeof(char), BUF_SIZE, fp);
+        if (rest > BUF_SIZE)
+        {
+            readret = send_message(client_socket, buf, BUF_SIZE);
+            if (readret != BUF_SIZE)
+            {
+                write_access_log(sockaddr[client_socket], 200,
+                                 file_size - rest + readret);
+                return;
+            }
+        }
+        else
+        {
+            readret = send_message(client_socket, buf, rest);
+            write_access_log(sockaddr[client_socket], 200,
+                             file_size - rest + readret);
+            return;
+        }
+        rest -= BUF_SIZE;
+    }
 }
 
 /**
@@ -381,31 +467,29 @@ int send_error(int client_socket, int code, char *msg)
  * @param client_socket 客户端socket编号
  * @param request 请求信息
  * @param buf 缓冲区
- * @return int 成功放回0，失败返回1
  */
-int handle_request(int client_socket, Request *request, char *buf)
+void handle_request(int client_socket, char *buf)
 {
-    char temp[BUF_SIZE];
+    char temp[64];
     if (request == NULL)
     {
-        write_access_log(sockaddr[client_socket], "Bad Request");
         write_error_log(2, sockaddr[client_socket], "message", "Bad request");
-        return send_error(client_socket, 400, "Bad Request");
+        send_error(client_socket, 400, "Bad Request");
+        return;
     }
-    sprintf(temp, "%s %s %s",
-            request->http_method, request->http_uri, request->http_version);
-    write_access_log(sockaddr[client_socket], temp);
     if (strcmp(request->http_version, "HTTP/1.1"))
     {
         write_error_log(2, sockaddr[client_socket],
                         "message", "HTTP version not supported");
-        return send_error(client_socket, 505, "HTTP Version Not Supported");
+        send_error(client_socket, 505, "HTTP Version Not Supported");
+        return;
     }
     else if (strlen(request->http_uri) >= 4096)
     {
         write_error_log(2, sockaddr[client_socket],
                         "message", "Request-URI too long");
-        return send_error(client_socket, 414, "Request-URI Too Long");
+        send_error(client_socket, 414, "Request-URI Too Long");
+        return;
     }
     else if (!strcmp(request->http_method, "GET") ||
              !strcmp(request->http_method, "HEAD"))
@@ -414,8 +498,6 @@ int handle_request(int client_socket, Request *request, char *buf)
         char file[4120];
         char filetime[32];
         char filetype[32];
-        FILE *fp;
-        long rest;
         time_t now = time(NULL);
         sprintf(file, "static_site%s", request->http_uri); // 文件路径
         url_decode(file, strlen(file));
@@ -423,7 +505,8 @@ int handle_request(int client_socket, Request *request, char *buf)
         {
             write_error_log(2, sockaddr[client_socket],
                             "message", strerror(errno));
-            return send_error(client_socket, 404, "Not found");
+            send_error(client_socket, 404, "Not found");
+            return;
         }
         if (S_ISDIR(sbuf.st_mode))
         {
@@ -432,7 +515,8 @@ int handle_request(int client_socket, Request *request, char *buf)
             {
                 write_error_log(2, sockaddr[client_socket],
                                 "message", strerror(errno));
-                return send_error(client_socket, 404, "Not found");
+                send_error(client_socket, 404, "Not found");
+                return;
             }
         }
         write_error_log(1, sockaddr[client_socket], "file", file);
@@ -440,7 +524,8 @@ int handle_request(int client_socket, Request *request, char *buf)
         {
             write_error_log(2, sockaddr[client_socket],
                             "message", strerror(errno));
-            return send_error(client_socket, 403, "Forbidden");
+            send_error(client_socket, 403, "Forbidden");
+            return;
         }
         get_filetype(file, filetype);
         memset(buf, 0, BUF_SIZE);
@@ -462,56 +547,27 @@ int handle_request(int client_socket, Request *request, char *buf)
         strcat(buf, "\r\n");
         if (!strcmp(request->http_method, "HEAD"))
         {
-            fprintf(access_log, "200 -\n");
-            write_error_log(2, sockaddr[client_socket], "message", "Success");
-            return send_message(client_socket, buf, strlen(buf));
+            write_error_log(2, sockaddr[client_socket], "message", "Prepared");
+            send_message(client_socket, buf, strlen(buf));
+            write_access_log(sockaddr[client_socket], 200, 0);
+            return;
         }
-        if ((fp = fopen(file, "rb")) == NULL)
-        {
-            sprintf(temp, "cannot open '%s': ", strerror(errno));
-            write_error_log(4, sockaddr[client_socket], "file", temp);
-            return send_error(client_socket, 403, "Forbidden");
-        }
-        rest = sbuf.st_size + strlen(buf);
-        fprintf(access_log, "200 %ld\n", sbuf.st_size);
-        write_error_log(2, sockaddr[client_socket], "message", "Success");
-        fread(buf + strlen(buf), sizeof(char), BUF_SIZE - strlen(buf), fp);
-        if (rest > BUF_SIZE)
-        {
-            if (send_message(client_socket, buf, BUF_SIZE))
-                return 1;
-        }
-        else
-            return send_message(client_socket, buf, rest);
-        rest -= BUF_SIZE;
-        while (1)
-        {
-            fread(buf, sizeof(char), BUF_SIZE, fp);
-            if (rest > BUF_SIZE)
-            {
-                if (send_message(client_socket, buf, BUF_SIZE))
-                    return 1;
-            }
-            else
-                return send_message(client_socket, buf, rest);
-            rest -= BUF_SIZE;
-        }
-        return 0;
+        send_file(client_socket, buf, file, sbuf.st_size);
     }
     else if (!strcmp(request->http_method, "POST"))
     {
-        fprintf(access_log, "- -\n");
-        write_error_log(2, sockaddr[client_socket], "message", "Success");
-        return send_message(client_socket, buf, strlen(buf));
+        write_error_log(2, sockaddr[client_socket], "message", "Prepared");
+        send_message(client_socket, buf, strlen(buf));
+        write_access_log(sockaddr[client_socket], 200, 0);
+        return;
     }
     else
     {
-        fprintf(access_log, "501 -\n");
         write_error_log(2, sockaddr[client_socket],
                         "message", "Not Implemented");
-        return send_error(client_socket, 501, "Not Implemented");
+        send_error(client_socket, 501, "Not Implemented");
+        return;
     }
-    return 1;
 }
 
 /** 异常退出动作 **/
@@ -534,7 +590,6 @@ int main(int argc, char *argv[])
     ssize_t readret;
     char buf[BUF_SIZE], temp[32];
     fd_set rset;
-    Request *request;
 
     // 设置日志记录等级
     if (argc > 1)
@@ -606,8 +661,7 @@ int main(int argc, char *argv[])
                     write_error_log(2, sockaddr[i], "message", temp);
                     write_error_log(0, sockaddr[i], "RECEIVE", buf);
                     request = parse(buf, readret, i);
-                    if (handle_request(i, request, buf))
-                        close_socket(i);
+                    handle_request(i, buf);
                     memset(buf, 0, BUF_SIZE);
                     if (request != NULL)
                     {
