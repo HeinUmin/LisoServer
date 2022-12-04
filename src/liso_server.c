@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <signal.h>
 #include <ctype.h>
 #include <time.h>
@@ -21,6 +22,16 @@ static int max_fd = 2;
 static struct sockaddr_in sockaddr[1024];
 static fd_set rfds;
 static Request *request;
+
+static inline char *to_upper_string(char *str)
+{
+    for (int i = 0; i < strlen(str); i++)
+    {
+        if (islower(str[i]))
+            str[i] = toupper(str[i]);
+    }
+    return str;
+}
 
 static inline int htoi(char *s)
 {
@@ -390,14 +401,11 @@ int send_error(int client_socket, int code, char *msg)
     char buf[BUF_SIZE];
     write_access_log(sockaddr[client_socket], code, 0);
     memset(buf, 0, BUF_SIZE);
-    sprintf(buf, "HTTP/1.1 %d %s\r\n\r\n", code, msg);
-    if (send_message(client_socket, buf, strlen(buf)) != strlen(buf))
-        return 1;
-    else
-    {
-        close_socket(client_socket);
-        return 0;
-    }
+    sprintf(buf, "HTTP/1.1 %d %s\r\n", code, msg);
+    strcat(buf, "Connection: keep-alive\r\n");
+    strcat(buf, "Server: liso/1.0\r\n");
+    strcat(buf, "Content-Length: 0\r\n\r\n");
+    return send_message(client_socket, buf, strlen(buf)) != strlen(buf);
 }
 
 /**
@@ -466,11 +474,12 @@ void send_file(int client_socket, char *buf, char *file, long file_size)
  * @brief 处理请求
  * @param client_socket 客户端socket编号
  * @param request 请求信息
- * @param buf 缓冲区
+ * @param buf 接收缓冲区
  */
-void handle_request(int client_socket, char *buf)
+void handle_request(int client_socket, char *recv_buf)
 {
     char temp[64];
+    char send_buf[BUF_SIZE];
     if (request == NULL)
     {
         write_error_log(2, sockaddr[client_socket], "message", "Bad request");
@@ -528,36 +537,36 @@ void handle_request(int client_socket, char *buf)
             return;
         }
         get_filetype(file, filetype);
-        memset(buf, 0, BUF_SIZE);
-        strcat(buf, "HTTP/1.1 200 OK\r\n");
-        strcat(buf, "Connection: keep-alive\r\n");
-        strcat(buf, "Server: liso/1.0\r\n");
+        memset(send_buf, 0, BUF_SIZE);
+        strcat(send_buf, "HTTP/1.1 200 OK\r\n");
+        strcat(send_buf, "Connection: keep-alive\r\n");
+        strcat(send_buf, "Server: liso/1.0\r\n");
         strftime(filetime, sizeof(filetime),
                  "%a, %d %b %Y %H:%M:%S %Z", gmtime(&now));
         sprintf(temp, "Date: %s\r\n", filetime);
-        strcat(buf, temp);
+        strcat(send_buf, temp);
         sprintf(temp, "Content-Type: %s\r\n", filetype);
-        strcat(buf, temp);
+        strcat(send_buf, temp);
         sprintf(temp, "Content-Length: %ld\r\n", sbuf.st_size);
-        strcat(buf, temp);
+        strcat(send_buf, temp);
         strftime(filetime, sizeof(filetime), "%a, %d %b %Y %H:%M:%S %Z",
                  gmtime(&sbuf.st_mtim.tv_sec));
         sprintf(temp, "Last-Modified: %s\r\n", filetime);
-        strcat(buf, temp);
-        strcat(buf, "\r\n");
+        strcat(send_buf, temp);
+        strcat(send_buf, "\r\n");
         if (!strcmp(request->http_method, "HEAD"))
         {
             write_error_log(2, sockaddr[client_socket], "message", "Prepared");
-            send_message(client_socket, buf, strlen(buf));
+            send_message(client_socket, send_buf, strlen(send_buf));
             write_access_log(sockaddr[client_socket], 200, 0);
             return;
         }
-        send_file(client_socket, buf, file, sbuf.st_size);
+        send_file(client_socket, send_buf, file, sbuf.st_size);
     }
     else if (!strcmp(request->http_method, "POST"))
     {
         write_error_log(2, sockaddr[client_socket], "message", "Prepared");
-        send_message(client_socket, buf, strlen(buf));
+        send_message(client_socket, recv_buf, strlen(recv_buf));
         write_access_log(sockaddr[client_socket], 200, 0);
         return;
     }
@@ -567,6 +576,124 @@ void handle_request(int client_socket, char *buf)
                         "message", "Not Implemented");
         send_error(client_socket, 501, "Not Implemented");
         return;
+    }
+}
+
+/**
+ * @brief 清除request数据
+ * @param client_socket 客户端socket编号
+ * @return int 关闭连接返回1，未关闭连接返回0
+ */
+int clean_request(int client_socket)
+{
+    int i = 0, j = 0;
+    if (request == NULL)
+        return 0;
+    for (j = 0; j < request->header_count; j++)
+    {
+        if (!strcmp(to_upper_string(request->headers[j].header_name),
+                    "CONNECTION") &&
+            !strcmp(to_upper_string(request->headers[j].header_value), "CLOSE"))
+        {
+            close_socket(client_socket);
+            i = 1;
+        }
+    }
+    free(request->headers);
+    request->headers = NULL;
+    free(request);
+    request = NULL;
+    return i;
+}
+
+/**
+ * @brief 处理pipeline
+ * @param client_socket 客户端socket编号
+ */
+void handle_pipeline(int client_socket)
+{
+    char temp[32], buf[BUF_SIZE];
+    ssize_t readret;
+    int i, offset, nread = -1;
+    char *separator;
+    // 第一次读取数据
+    if ((readret = recv(client_socket, buf, BUF_SIZE, 0)) == 0)
+    {
+        close_socket(client_socket);
+        return;
+    }
+    if (readret < 0)
+    {
+        write_error_log(4, sockaddr[sock], "socket", strerror(errno));
+        close_socket(client_socket);
+        return;
+    }
+    sprintf(temp, "Receiving message at socket %d", client_socket);
+    write_error_log(2, sockaddr[client_socket], "message", temp);
+    write_error_log(0, sockaddr[client_socket], "RECEIVE", buf);
+    while (1)
+    {
+        if (app_stopped)
+            return;
+        offset = 4;
+        request = parse(buf, BUF_SIZE, client_socket);
+        handle_request(client_socket, buf);
+        // 根据Content_Length的值设定偏移量
+        if (request)
+            for (i = 0; i < request->header_count; i++)
+            {
+                if (!strcmp(to_upper_string(request->headers[i].header_name),
+                            "CONTENT_LENGTH"))
+                {
+                    offset = atoi(request->headers[i].header_value) + 4;
+                    break;
+                }
+            }
+        // 如果找不到"\r\n\r\n"，说明接收缓冲区已无法找到完整的请求，退出
+        if ((separator = strstr(buf, "\r\n\r\n")) == NULL)
+        {
+            if (!clean_request(client_socket))
+                close_socket(client_socket);
+            return;
+        }
+        offset += separator - buf;
+        // 根据偏移量移动数据，并从socket缓存中读取更多数据
+        memmove(buf, buf + offset, BUF_SIZE - offset);
+        memset(buf + BUF_SIZE - offset, 0, offset);
+        // 如果socket缓存中没有更多数据，则不再读取新数据
+        if (nread)
+            ioctl(client_socket, FIONREAD, &nread);
+        if (nread)
+        {
+            readret = recv(client_socket, buf + BUF_SIZE - offset, offset, 0);
+            if (readret == 0)
+            {
+                close_socket(client_socket);
+                clean_request(client_socket);
+                return;
+            }
+            if (readret < 0)
+            {
+                write_error_log(4, sockaddr[sock], "socket", strerror(errno));
+                close_socket(client_socket);
+                clean_request(client_socket);
+                return;
+            }
+            if (readret < offset)
+                nread = 0;
+            sprintf(temp, "Receiving message at socket %d", client_socket);
+            write_error_log(2, sockaddr[client_socket], "message", temp);
+            write_error_log(0, sockaddr[client_socket],
+                            "RECEIVE", buf + BUF_SIZE - offset);
+        }
+        // buf为空则退出
+        else if (buf[0] == '\0')
+        {
+            clean_request(client_socket);
+            return;
+        }
+        if (clean_request(client_socket))
+            return;
     }
 }
 
@@ -587,8 +714,7 @@ void exit_failure()
 int main(int argc, char *argv[])
 {
     int nready, i;
-    ssize_t readret;
-    char buf[BUF_SIZE], temp[32];
+    char temp[32];
     fd_set rset;
 
     // 设置日志记录等级
@@ -650,34 +776,9 @@ int main(int argc, char *argv[])
         {
             if (app_stopped)
                 break;
-
             if (FD_ISSET(i, &rset))
             {
-                if ((readret = recv(i, buf, BUF_SIZE, 0)) == 0)
-                    close_socket(i);
-                else if (readret > 0)
-                {
-                    sprintf(temp, "Receiving message at socket %d", i);
-                    write_error_log(2, sockaddr[i], "message", temp);
-                    write_error_log(0, sockaddr[i], "RECEIVE", buf);
-                    request = parse(buf, readret, i);
-                    handle_request(i, buf);
-                    memset(buf, 0, BUF_SIZE);
-                    if (request != NULL)
-                    {
-                        free(request->headers);
-                        request->headers = NULL;
-                        free(request);
-                        request = NULL;
-                    }
-                }
-                else
-                {
-                    write_error_log(4, sockaddr[sock], "socket",
-                                    strerror(errno));
-                    close_socket(i);
-                }
-
+                handle_pipeline(i);
                 if (--nready == 0)
                     break;
             }
