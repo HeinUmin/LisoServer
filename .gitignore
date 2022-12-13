@@ -12,3 +12,5 @@ y.*
 .vscode/
 .history/
 log/
+.clang-format
+.siegerc

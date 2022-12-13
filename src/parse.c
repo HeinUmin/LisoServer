@@ -1,6 +1,7 @@
 #include "parse.h"
 
 extern void yyrestart(FILE *);
+extern int yylex_destroy(void);
 /**
 * Given a char buffer returns the parsed request headers
 */
@@ -56,8 +57,10 @@ Request * parse(char *buffer, int size, int socketFd) {
 		set_parsing_options(buf, i, request);
 		yyrestart(NULL);
 		if (yyparse() == SUCCESS) {
+			yylex_destroy();
             return request;
 		}
+		yylex_destroy();
 		free(request->headers);
 		request->headers = NULL;
 		free(request);

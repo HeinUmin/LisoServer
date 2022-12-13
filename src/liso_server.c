@@ -1,39 +1,42 @@
+#include "parse.h"
 #include <arpa/inet.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <signal.h>
 #include <ctype.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
-#include <errno.h>
-#include "parse.h"
 
 #define ECHO_PORT 9999
 #define BUF_SIZE 8192
 
-static int log_level = 2;
-static int app_stopped = 0;
-static FILE *access_log = NULL;
-static FILE *error_log = NULL;
-static char *level_char[] =
+static int log_level = 2;       // 日志记录等级
+static int app_stopped = 0;     // 强制停止程序的次数
+static FILE *access_log = NULL; // access_log文件指针
+static FILE *error_log = NULL;  // error_log文件指针
+static char *level_char[] =     // 日志等级字符串
     {"trace", "debug", "info", "warn", "error", "fatal"};
-static int sock = -1;
-static int max_fd = 2;
-static struct sockaddr_in sockaddr[1024];
-static fd_set rfds;
-static Request *request;
+static int sock = -1;                     // 服务器socket编号
+static int max_fd = 2;                    // 当前最大文件描述符
+static struct sockaddr_in sockaddr[1024]; // 地址数据
+static fd_set rfds;                       // 当前可用文件描述符
+static Request *request;                  // 当前请求
+static int cur_sock;                      // 当前客户端socket编号
+static int concurrent = 1;                // 是否开启并发
 
-static inline char *to_upper_string(char *str)
+static inline char *to_upper_string(char *str) // 字符串变大写
 {
-    for (int i = 0; i < strlen(str); i++)
-    {
+    for (int i = 0; i < strlen(str); i++) {
         if (islower(str[i]))
             str[i] = toupper(str[i]);
     }
     return str;
 }
 
-static inline int htoi(char *s)
+static inline int htoi(char *s) // 十六进制数字符串转十进制整数
 {
     int value;
     int c;
@@ -62,18 +65,15 @@ int url_decode(char *str, int len)
     char *dest = str;
     char *data = str;
 
-    while (len--)
-    {
+    while (len--) {
         if (*data == '+')
             *dest = ' ';
-        else if (*data == '%' && len >= 2 &&
-                 isxdigit((int)*(data + 1)) && isxdigit((int)*(data + 2)))
-        {
+        else if (*data == '%' && len >= 2 && isxdigit((int)*(data + 1)) &&
+                 isxdigit((int)*(data + 2))) {
             *dest = (char)htoi(data + 1);
             data += 2;
             len -= 2;
-        }
-        else if (*data == '?')
+        } else if (*data == '?')
             break;
         else
             *dest = *data;
@@ -85,10 +85,9 @@ int url_decode(char *str, int len)
 }
 
 /**
- * @brief Get the filetype object
- *
- * @param filename
- * @param filetype
+ * @brief 获取文件类型
+ * @param filename 文件名
+ * @param filetype 文件类型
  */
 void get_filetype(char *filename, char *filetype)
 {
@@ -107,9 +106,8 @@ void get_filetype(char *filename, char *filetype)
 }
 
 /**
- * @brief Set the log level object
- *
- * @param level
+ * @brief 设定日志记录等级
+ * @param level 等级参数
  */
 void set_log_level(char *level)
 {
@@ -120,13 +118,11 @@ void set_log_level(char *level)
     const char *default_char = "List of log level:\n-i -- infomation\n"
                                "-w -- warning\n-e -- error\n-f -- fatal\n"
                                "Log level has been set as default 'info'.\n";
-    if (level[0] != '-')
-    {
+    if (level[0] != '-') {
         puts(default_char);
         return;
     }
-    switch (level[1])
-    {
+    switch (level[1]) {
     case 't':
         log_level = 0;
         break;
@@ -145,16 +141,19 @@ void set_log_level(char *level)
     case 'f':
         log_level = 5;
         break;
+    case 'n':
+        log_level = 1;
+        concurrent = 0;
+        fprintf(stdout, "Set non-concurrent.\n");
+        return;
     default:
         puts(default_char);
         return;
     }
-    if (level[2])
-    {
+    if (level[2]) {
         log_level = 2;
         puts(default_char);
-    }
-    else
+    } else
         fprintf(stdout, "Log level has been set as '%s'.\n",
                 level_char[log_level]);
 }
@@ -168,8 +167,7 @@ int init_log()
     mkdir("log", 0777);
     access_log = fopen("log/access_log", "w");
     error_log = fopen("log/error_log", "w");
-    if (!access_log || !error_log)
-    {
+    if (!access_log || !error_log) {
         fprintf(stderr, "Error opening log file.\n");
         return 1;
     }
@@ -186,15 +184,14 @@ void write_access_log(struct sockaddr_in addr, int code, long sent)
 {
     char time_char[32];
     time_t now = time(NULL);
-    strftime(time_char, sizeof(time_char),
-             "[%d/%b/%Y:%H:%M:%S %z]", gmtime(&now));
+    strftime(time_char, sizeof(time_char), "[%d/%b/%Y:%H:%M:%S %z]",
+             gmtime(&now));
     fprintf(access_log, "%s - - %s ", inet_ntoa(addr.sin_addr), time_char);
     if (request == NULL)
         fprintf(access_log, "\"Bad Request\" 400 -\n");
-    else
-    {
-        fprintf(access_log, "\"%s %s %s\" ",
-                request->http_method, request->http_uri, request->http_version);
+    else {
+        fprintf(access_log, "\"%s %s %s\" ", request->http_method,
+                request->http_uri, request->http_version);
         if (sent > 0)
             fprintf(access_log, "%d %ld\n", code, sent);
         else
@@ -217,23 +214,9 @@ void write_error_log(int level, struct sockaddr_in addr, char *src, char *msg)
         return;
     strncpy(time_char, ctime(&now), 24);
     time_char[24] = '\0';
-    fprintf(error_log, "[%s] [%s] [pid %d] [client %s:%d] %s:  %s\n",
-            time_char, level_char[level], getpid(),
-            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), src, msg);
-}
-
-/**
- * @brief 终止动作
- * @param sig 终止信号
- */
-void signal_handler(int sig)
-{
-    // 为防止程序被socket阻塞无法退出，当接收到3个以上终止信号时，直接退出程序
-    if (app_stopped > 3)
-        exit(1);
-    write_error_log(3, sockaddr[sock], "liso", "Interrupted by signal");
-    fprintf(stdout, "Interrupted by signal %d.\n", sig);
-    app_stopped++;
+    fprintf(error_log, "[%s] [%s] [pid %d] [client %s:%d] %s:  %s\n", time_char,
+            level_char[level], getpid(), inet_ntoa(addr.sin_addr),
+            ntohs(addr.sin_port), src, msg);
 }
 
 /**
@@ -244,9 +227,8 @@ void signal_handler(int sig)
 int close_socket(int socket_no)
 {
     char temp[32];
-    if (close(socket_no))
-    {
-        write_error_log(4, sockaddr[socket_no], "socket", strerror(errno));
+    if (close(socket_no)) {
+        write_error_log(4, sockaddr[socket_no], "close", strerror(errno));
         fprintf(stderr, "Failed closing socket.\n");
         FD_CLR(socket_no, &rfds);
         sprintf(temp, "Remove fd %d", socket_no);
@@ -270,21 +252,19 @@ int connect_socket()
     int client_sock;
     char temp[32];
     socklen_t cli_size = sizeof(sockaddr[0]);
-    if ((client_sock = accept(sock, (struct sockaddr *)&sockaddr[0],
-                              &cli_size)) == -1)
-    {
-        write_error_log(4, sockaddr[0], "socket", strerror(errno));
+    if ((client_sock =
+             accept(sock, (struct sockaddr *)&sockaddr[0], &cli_size)) == -1) {
+        write_error_log(4, sockaddr[0], "accept", strerror(errno));
         fprintf(stderr, "Error accepting connection.\n");
         return 1;
     }
     sockaddr[client_sock] = sockaddr[0];
-    if (client_sock >= FD_SETSIZE)
-    {
-        write_error_log(3, sockaddr[client_sock],
-                        "socket", strerror(24));
+    if (client_sock >= FD_SETSIZE) {
+        write_error_log(3, sockaddr[client_sock], "socket", strerror(24));
         close_socket(client_sock);
         return 1;
     }
+    cur_sock = client_sock;
     sprintf(temp, "Connect socket %d", client_sock);
     write_error_log(2, sockaddr[client_sock], "socket", temp);
     FD_SET(client_sock, &rfds);
@@ -296,12 +276,41 @@ int connect_socket()
 }
 
 /**
+ * @brief 异常处理
+ * @param sig 异常信号
+ */
+void signal_handler(int sig)
+{
+    // 当socket无法写入时，关闭当前socket连接
+    if (sig == SIGPIPE) {
+        write_error_log(4, sockaddr[cur_sock], "signal",
+                        "Receive signal SIGPIPE");
+        close_socket(cur_sock);
+        return;
+    }
+    // 当设定为非并发模式时，断开socket后退出程序，无需其他处理
+    if (!concurrent) {
+        write_error_log(3, sockaddr[sock], "signal", "Interrupted by signal");
+        fprintf(stdout, "Interrupted by signal %d.\n", sig);
+        close_socket(sock);
+        exit(0);
+    }
+    // 为防止程序被socket阻塞无法退出，当接收到3个以上终止信号时，直接退出程序
+    if (app_stopped > 3)
+        exit(1);
+    write_error_log(3, sockaddr[sock], "signal", "Interrupted by signal");
+    fprintf(stdout, "Interrupted by signal %d.\n", sig);
+    app_stopped++;
+}
+
+/**
  * @brief 初始化socket
  * @return int 初始化成功返回0，初始化失败返回1
  */
 int init_socket()
 {
     int reuse = 1;
+    struct timeval timeout = {3, 0};
     char temp[32];
 
     // 设定地址和端口
@@ -312,8 +321,8 @@ int init_socket()
     // 重定义程序终止行为
     if ((signal(SIGINT, signal_handler) == SIG_ERR) ||
         (signal(SIGQUIT, signal_handler) == SIG_ERR) ||
-        (signal(SIGTERM, signal_handler) == SIG_ERR))
-    {
+        (signal(SIGTERM, signal_handler) == SIG_ERR) ||
+        (signal(SIGPIPE, signal_handler) == SIG_ERR)) {
         write_error_log(3, sockaddr[0], "signal", strerror(errno));
         fprintf(stderr, "Failed set signal handler.\n");
     }
@@ -321,9 +330,8 @@ int init_socket()
     fprintf(stdout, "----- Liso Server -----\n");
     write_error_log(1, sockaddr[0], "liso", "Server starting");
 
-    /* all networked programs must create a socket */
-    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1)
-    {
+    // 获取socket地址
+    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) == -1) {
         write_error_log(5, sockaddr[0], "socket", strerror(errno));
         fprintf(stderr, "Failed creating socket.\n");
         return 1;
@@ -337,18 +345,27 @@ int init_socket()
     write_error_log(1, sockaddr[sock], "select", temp);
     max_fd = sock;
 
-    // 设定socket可重用
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1)
-    {
-        write_error_log(3, sockaddr[sock], "socket", strerror(errno));
-        fprintf(stderr, "Failed setting sockopt.\n");
-    }
-    else
+    // 设定socket可重用和socket超时
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) ==
+        -1) {
+        write_error_log(3, sockaddr[sock], "setsockopt", strerror(errno));
+        fprintf(stderr, "Failed setting sockopt reusable.\n");
+    } else
         write_error_log(1, sockaddr[sock], "socket", "Set socket reuseable");
+    if (concurrent) {
+        if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
+                       sizeof(struct timeval)) == -1 ||
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout,
+                       sizeof(struct timeval)) == -1) {
+            write_error_log(3, sockaddr[sock], "setsockopt", strerror(errno));
+            fprintf(stderr, "Failed setting sockopt timeout.\n");
+        } else
+            write_error_log(1, sockaddr[sock], "socket", "Set socket timeout");
+    }
 
-    /* servers bind sockets to ports---notify the OS they accept connections */
-    if (bind(sock, (struct sockaddr *)&sockaddr[sock], sizeof(sockaddr[sock])))
-    {
+    // 绑定socket
+    if (bind(sock, (struct sockaddr *)&sockaddr[sock],
+             sizeof(sockaddr[sock]))) {
         write_error_log(5, sockaddr[sock], "socket", strerror(errno));
         fprintf(stderr, "Failed binding socket.\n");
         close_socket(sock);
@@ -357,8 +374,8 @@ int init_socket()
     sprintf(temp, "Bind socket %d", sock);
     write_error_log(1, sockaddr[sock], "socket", temp);
 
-    if (listen(sock, 5))
-    {
+    // 监听socket
+    if (listen(sock, 5)) {
         write_error_log(5, sockaddr[sock], "socket", strerror(errno));
         fprintf(stderr, "Error listening on socket.\n");
         close_socket(sock);
@@ -380,9 +397,8 @@ long send_message(int client_socket, char *buf, int length)
 {
     int readret;
     write_error_log(0, sockaddr[client_socket], "SEND", buf);
-    if ((readret = send(client_socket, buf, length, 0)) != length)
-    {
-        write_error_log(4, sockaddr[client_socket], "socket", strerror(errno));
+    if ((readret = send(client_socket, buf, length, 0)) != length) {
+        write_error_log(4, sockaddr[client_socket], "send", strerror(errno));
         fprintf(stderr, "Error sending to client.\n");
         close_socket(client_socket);
     }
@@ -419,9 +435,8 @@ void send_file(int client_socket, char *buf, char *file, long file_size)
 {
     FILE *fp;
     long rest, readret;
-    if ((fp = fopen(file, "rb")) == NULL)
-    {
-        write_error_log(4, sockaddr[client_socket], "file", strerror(errno));
+    if ((fp = fopen(file, "rb")) == NULL) {
+        write_error_log(4, sockaddr[client_socket], "fopen", strerror(errno));
         send_error(client_socket, 500, "Internal Server Error");
         return;
     }
@@ -429,41 +444,43 @@ void send_file(int client_socket, char *buf, char *file, long file_size)
     rest = file_size + headsize;
     write_error_log(2, sockaddr[client_socket], "message", "Prepared");
     fread(buf + headsize, sizeof(char), BUF_SIZE - headsize, fp);
-    if (rest > BUF_SIZE)
-    {
+    if (rest > BUF_SIZE) {
         readret = send_message(client_socket, buf, BUF_SIZE);
-        if (readret != BUF_SIZE)
-        {
-            write_access_log(sockaddr[client_socket],
-                             200, readret - headsize);
+        if (readret != BUF_SIZE) {
+            write_access_log(sockaddr[client_socket], 200, readret - headsize);
+            if (fclose(fp))
+                write_error_log(4, sockaddr[client_socket], "fclose",
+                                strerror(errno));
             return;
         }
-    }
-    else
-    {
+    } else {
         readret = send_message(client_socket, buf, rest);
         write_access_log(sockaddr[client_socket], 200, readret - headsize);
+        if (fclose(fp))
+            write_error_log(4, sockaddr[client_socket], "fclose",
+                            strerror(errno));
         return;
     }
     rest -= BUF_SIZE;
-    while (1)
-    {
+    while (1) {
         fread(buf, sizeof(char), BUF_SIZE, fp);
-        if (rest > BUF_SIZE)
-        {
+        if (rest > BUF_SIZE) {
             readret = send_message(client_socket, buf, BUF_SIZE);
-            if (readret != BUF_SIZE)
-            {
+            if (readret != BUF_SIZE) {
                 write_access_log(sockaddr[client_socket], 200,
                                  file_size - rest + readret);
+                if (fclose(fp))
+                    write_error_log(4, sockaddr[client_socket], "fclose",
+                                    strerror(errno));
                 return;
             }
-        }
-        else
-        {
+        } else {
             readret = send_message(client_socket, buf, rest);
             write_access_log(sockaddr[client_socket], 200,
                              file_size - rest + readret);
+            if (fclose(fp))
+                write_error_log(4, sockaddr[client_socket], "fclose",
+                                strerror(errno));
             return;
         }
         rest -= BUF_SIZE;
@@ -480,29 +497,23 @@ void handle_request(int client_socket, char *recv_buf)
 {
     char temp[64];
     char send_buf[BUF_SIZE];
-    if (request == NULL)
-    {
+    if (request == NULL) {
         write_error_log(2, sockaddr[client_socket], "message", "Bad request");
         send_error(client_socket, 400, "Bad Request");
         return;
     }
-    if (strcmp(request->http_version, "HTTP/1.1"))
-    {
-        write_error_log(2, sockaddr[client_socket],
-                        "message", "HTTP version not supported");
+    if (strcmp(request->http_version, "HTTP/1.1")) {
+        write_error_log(2, sockaddr[client_socket], "message",
+                        "HTTP version not supported");
         send_error(client_socket, 505, "HTTP Version Not Supported");
         return;
-    }
-    else if (strlen(request->http_uri) >= 4096)
-    {
-        write_error_log(2, sockaddr[client_socket],
-                        "message", "Request-URI too long");
+    } else if (strlen(request->http_uri) >= 4096) {
+        write_error_log(2, sockaddr[client_socket], "message",
+                        "Request-URI too long");
         send_error(client_socket, 414, "Request-URI Too Long");
         return;
-    }
-    else if (!strcmp(request->http_method, "GET") ||
-             !strcmp(request->http_method, "HEAD"))
-    {
+    } else if (!strcmp(request->http_method, "GET") ||
+               !strcmp(request->http_method, "HEAD")) {
         struct stat sbuf;
         char file[4120];
         char filetime[32];
@@ -510,39 +521,37 @@ void handle_request(int client_socket, char *recv_buf)
         time_t now = time(NULL);
         sprintf(file, "static_site%s", request->http_uri); // 文件路径
         url_decode(file, strlen(file));
-        if (stat(file, &sbuf) < 0)
-        {
-            write_error_log(2, sockaddr[client_socket],
-                            "message", strerror(errno));
+        // 判断文件是否可用
+        if (stat(file, &sbuf) < 0) {
+            write_error_log(2, sockaddr[client_socket], "message",
+                            strerror(errno));
             send_error(client_socket, 404, "Not found");
             return;
         }
-        if (S_ISDIR(sbuf.st_mode))
-        {
+        if (S_ISDIR(sbuf.st_mode)) {
             strcat(file, "index.html");
-            if (stat(file, &sbuf) < 0)
-            {
-                write_error_log(2, sockaddr[client_socket],
-                                "message", strerror(errno));
+            if (stat(file, &sbuf) < 0) {
+                write_error_log(2, sockaddr[client_socket], "message",
+                                strerror(errno));
                 send_error(client_socket, 404, "Not found");
                 return;
             }
         }
         write_error_log(1, sockaddr[client_socket], "file", file);
-        if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode))
-        {
-            write_error_log(2, sockaddr[client_socket],
-                            "message", strerror(errno));
+        if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
+            write_error_log(2, sockaddr[client_socket], "message",
+                            strerror(errno));
             send_error(client_socket, 403, "Forbidden");
             return;
         }
         get_filetype(file, filetype);
+        // 生成header
         memset(send_buf, 0, BUF_SIZE);
         strcat(send_buf, "HTTP/1.1 200 OK\r\n");
         strcat(send_buf, "Connection: keep-alive\r\n");
         strcat(send_buf, "Server: liso/1.0\r\n");
-        strftime(filetime, sizeof(filetime),
-                 "%a, %d %b %Y %H:%M:%S %Z", gmtime(&now));
+        strftime(filetime, sizeof(filetime), "%a, %d %b %Y %H:%M:%S %Z",
+                 gmtime(&now));
         sprintf(temp, "Date: %s\r\n", filetime);
         strcat(send_buf, temp);
         sprintf(temp, "Content-Type: %s\r\n", filetype);
@@ -550,30 +559,25 @@ void handle_request(int client_socket, char *recv_buf)
         sprintf(temp, "Content-Length: %ld\r\n", sbuf.st_size);
         strcat(send_buf, temp);
         strftime(filetime, sizeof(filetime), "%a, %d %b %Y %H:%M:%S %Z",
-                 gmtime(&sbuf.st_mtim.tv_sec));
+                 gmtime(&sbuf.st_mtime));
         sprintf(temp, "Last-Modified: %s\r\n", filetime);
         strcat(send_buf, temp);
         strcat(send_buf, "\r\n");
-        if (!strcmp(request->http_method, "HEAD"))
-        {
+        if (!strcmp(request->http_method, "HEAD")) {
             write_error_log(2, sockaddr[client_socket], "message", "Prepared");
             send_message(client_socket, send_buf, strlen(send_buf));
             write_access_log(sockaddr[client_socket], 200, 0);
             return;
         }
         send_file(client_socket, send_buf, file, sbuf.st_size);
-    }
-    else if (!strcmp(request->http_method, "POST"))
-    {
+    } else if (!strcmp(request->http_method, "POST")) {
         write_error_log(2, sockaddr[client_socket], "message", "Prepared");
         send_message(client_socket, recv_buf, strlen(recv_buf));
         write_access_log(sockaddr[client_socket], 200, 0);
         return;
-    }
-    else
-    {
-        write_error_log(2, sockaddr[client_socket],
-                        "message", "Not Implemented");
+    } else {
+        write_error_log(2, sockaddr[client_socket], "message",
+                        "Not Implemented");
         send_error(client_socket, 501, "Not Implemented");
         return;
     }
@@ -589,12 +593,11 @@ int clean_request(int client_socket)
     int i = 0, j = 0;
     if (request == NULL)
         return 0;
-    for (j = 0; j < request->header_count; j++)
-    {
+    for (j = 0; j < request->header_count; j++) {
         if (!strcmp(to_upper_string(request->headers[j].header_name),
                     "CONNECTION") &&
-            !strcmp(to_upper_string(request->headers[j].header_value), "CLOSE"))
-        {
+            !strcmp(to_upper_string(request->headers[j].header_value),
+                    "CLOSE")) {
             close_socket(client_socket);
             i = 1;
         }
@@ -609,38 +612,42 @@ int clean_request(int client_socket)
 /**
  * @brief 处理pipeline
  * @param client_socket 客户端socket编号
+ * @return int 未断开连接返回0，断开连接返回1
  */
-void handle_pipeline(int client_socket)
+int handle_pipeline(int client_socket)
 {
     char temp[32], buf[BUF_SIZE];
     ssize_t readret;
-    int i, offset, nread = -1;
+    int offset, nread, valid = 0;
     char *separator;
+    memset(buf, 0, BUF_SIZE);
     // 第一次读取数据
-    if ((readret = recv(client_socket, buf, BUF_SIZE, 0)) == 0)
-    {
+    if ((readret = recv(client_socket, buf, BUF_SIZE, 0)) == 0) {
         close_socket(client_socket);
-        return;
+        return 1;
     }
-    if (readret < 0)
-    {
-        write_error_log(4, sockaddr[sock], "socket", strerror(errno));
+    if (readret < 0) {
+        write_error_log(4, sockaddr[sock], "recv", strerror(errno));
         close_socket(client_socket);
-        return;
+        return 1;
     }
     sprintf(temp, "Receiving message at socket %d", client_socket);
     write_error_log(2, sockaddr[client_socket], "message", temp);
     write_error_log(0, sockaddr[client_socket], "RECEIVE", buf);
-    while (1)
-    {
-        if (app_stopped)
-            return;
+    valid = readret;
+
+    while (1) {
+        if (app_stopped) {
+            close_socket(client_socket);
+            return 1;
+        }
         offset = 4;
-        request = parse(buf, BUF_SIZE, client_socket);
+        request = parse(buf, valid, client_socket);
         handle_request(client_socket, buf);
-        // 根据Content_Length的值设定偏移量
+
+        /** 根据Content_Length的值设定偏移量
         if (request)
-            for (i = 0; i < request->header_count; i++)
+            for (int i = 0; i < request->header_count; i++)
             {
                 if (!strcmp(to_upper_string(request->headers[i].header_name),
                             "CONTENT_LENGTH"))
@@ -649,51 +656,46 @@ void handle_pipeline(int client_socket)
                     break;
                 }
             }
+        本次实验不需要对带有body的请求进行解析，因此为提高性能，此部分代码不使用**/
+
         // 如果找不到"\r\n\r\n"，说明接收缓冲区已无法找到完整的请求，退出
-        if ((separator = strstr(buf, "\r\n\r\n")) == NULL)
-        {
+        if ((separator = strstr(buf, "\r\n\r\n")) == NULL) {
             if (!clean_request(client_socket))
                 close_socket(client_socket);
-            return;
+            return 1;
         }
         offset += separator - buf;
+        valid -= offset;
         // 根据偏移量移动数据，并从socket缓存中读取更多数据
-        memmove(buf, buf + offset, BUF_SIZE - offset);
-        memset(buf + BUF_SIZE - offset, 0, offset);
+        memmove(buf, buf + offset, valid);
+        memset(buf + valid, 0, BUF_SIZE - valid);
         // 如果socket缓存中没有更多数据，则不再读取新数据
-        if (nread)
-            ioctl(client_socket, FIONREAD, &nread);
-        if (nread)
-        {
-            readret = recv(client_socket, buf + BUF_SIZE - offset, offset, 0);
-            if (readret == 0)
-            {
+        ioctl(client_socket, FIONREAD, &nread);
+        if (nread) {
+            readret = recv(client_socket, buf + valid, BUF_SIZE - valid, 0);
+            if (readret == 0) {
                 close_socket(client_socket);
                 clean_request(client_socket);
-                return;
+                return 1;
             }
-            if (readret < 0)
-            {
-                write_error_log(4, sockaddr[sock], "socket", strerror(errno));
+            if (readret < 0) {
+                write_error_log(4, sockaddr[sock], "recv", strerror(errno));
                 close_socket(client_socket);
                 clean_request(client_socket);
-                return;
+                return 1;
             }
-            if (readret < offset)
-                nread = 0;
             sprintf(temp, "Receiving message at socket %d", client_socket);
             write_error_log(2, sockaddr[client_socket], "message", temp);
-            write_error_log(0, sockaddr[client_socket],
-                            "RECEIVE", buf + BUF_SIZE - offset);
+            write_error_log(0, sockaddr[client_socket], "RECEIVE", buf + valid);
+            valid += readret;
         }
         // buf为空则退出
-        else if (buf[0] == '\0')
-        {
+        else if (valid <= 0) {
             clean_request(client_socket);
-            return;
+            return 0;
         }
         if (clean_request(client_socket))
-            return;
+            return 1;
     }
 }
 
@@ -723,8 +725,7 @@ int main(int argc, char *argv[])
     if (init_log())
         return EXIT_FAILURE;
 
-    if (init_socket())
-    {
+    if (init_socket()) {
         close_socket(sock);
         write_error_log(2, sockaddr[0], "liso", "Server closing with error");
         fclose(access_log);
@@ -733,9 +734,26 @@ int main(int argc, char *argv[])
     }
     write_error_log(2, sockaddr[sock], "liso", "Init successful");
 
-    /* finally, loop waiting for input and then write it back */
-    while (1)
-    {
+    // 设定为不并发时执行的操作
+    if (!concurrent) {
+        while (1) {
+            if (app_stopped)
+                break;
+            fflush(error_log);
+            fflush(access_log);
+            if (!connect_socket())
+                while (!handle_pipeline(cur_sock))
+                    if (app_stopped)
+                        break;
+        }
+        close_socket(sock);
+        write_error_log(2, sockaddr[sock], "liso", "Server closing normally");
+        fclose(access_log);
+        fclose(error_log);
+        return EXIT_SUCCESS;
+    }
+
+    while (1) {
         // 写磁盘
         fflush(error_log);
         fflush(access_log);
@@ -743,41 +761,37 @@ int main(int argc, char *argv[])
         rset = rfds;
         nready = select(FD_SETSIZE, &rset, NULL, NULL, NULL);
 
-        if (app_stopped)
-        {
+        if (app_stopped) {
             for (i = sock + 1; i <= max_fd; i++)
                 if (FD_ISSET(i, &rfds))
                     close_socket(i);
             break;
         }
 
-        if (nready < 0)
-        {
+        // select错误
+        if (nready < 0) {
             write_error_log(5, sockaddr[sock], "select", strerror(errno));
             fprintf(stderr, "Select error.\n");
             exit_failure();
-        }
-        else if (nready == 0)
-        {
+        } else if (nready == 0) {
             write_error_log(3, sockaddr[sock], "select", "Select timeout");
             continue;
         }
         sprintf(temp, "Select %d", nready);
         write_error_log(1, sockaddr[sock], "select", temp);
 
-        if (FD_ISSET(sock, &rset))
-        {
+        // 建立新连接
+        if (FD_ISSET(sock, &rset)) {
             connect_socket();
             if (--nready == 0)
                 continue;
         }
 
-        for (i = sock + 1; i <= max_fd; i++)
-        {
+        for (i = sock + 1; i <= max_fd; i++) {
             if (app_stopped)
                 break;
-            if (FD_ISSET(i, &rset))
-            {
+            if (FD_ISSET(i, &rset)) {
+                cur_sock = i;
                 handle_pipeline(i);
                 if (--nready == 0)
                     break;
